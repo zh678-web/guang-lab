@@ -18,6 +18,27 @@
 
 ---
 
+## 本 fork 新增：PC 桌面版（`pc/`）
+
+> 本仓库是 [Yukstarlight/guang-lab](https://github.com/Yukstarlight/guang-lab) 的 fork。
+> 下面的原 Android 版内容与 `app/` 源码**保持原样**；新增的 [`pc/`](pc/README.md)
+> 是 **Windows 桌面移植版**：在电脑上运行，通过 USB / WiFi ADB 管理手机。
+
+原版为了在手机上拿到 `uid=2000(shell)`，需要 Shizuku / 无线调试 ADB / Root 三条通道自动降级；
+而电脑上的 `adb shell` **天生就是 shell 身份**，所以 PC 版只需要一条通道，手机端只要求开 USB 调试。
+
+| | 原 Android 版 | PC 桌面版 |
+|---|---|---|
+| 运行位置 | 手机 APK（Kotlin） | Windows 单文件 `exe`（Python + Qt） |
+| 权限通道 | 三通道自动降级 | 仅 `adb shell`，可选 `su -c` |
+| 执行脚本 | `app/src/main/res/raw/*.sh` | **同一份脚本逐字节复用** |
+| 回执协议 | `R\|分组\|条目\|状态\|详情` | **完全不变** |
+
+功能、安全模型、构建与自检方式见 **[pc/README.md](pc/README.md)**。
+快速使用：手机开 USB 调试并授权 → 双击 `pc/dist/GuangLabPC.exe` → 刷新应用 → 一键授权。
+
+---
+
 Android **系统级权限工具箱**（minSdk 26 / targetSdk 34）。所有操作都是 **shell 直写**：不弹设置页、不做模拟点击、不依赖无障碍去点开关。
 
 装好之后大致能干这些事：**一次把某个应用的基础权限配齐**、**冻结 / 卸载平时不用的应用**（还能一键装回来）、**随手跑一条 shell** 验证系统行为——全过程**不需要连电脑**。
