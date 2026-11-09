@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import os
+import threading
 import time
 from datetime import datetime
 from typing import Callable
@@ -90,6 +91,24 @@ class Worker(QThread):
             self.failed.emit(f"{type(e).__name__}: {e}")
 
 
+class BatchWorker(QThread):
+    """批量解析：逐条把结果发回主线程，界面不阻塞、可随时停止。"""
+
+    item = Signal(object)          # (pkg, name, reason, done, total)
+    finished_all = Signal(int)
+    failed = Signal(str)
+
+    def __init__(self, fn: Callable, parent=None):
+        super().__init__(parent)
+        self.fn = fn
+
+    def run(self):
+        try:
+            self.finished_all.emit(self.fn(lambda v: self.item.emit(v)))
+        except Exception as e:  # noqa: BLE001
+            self.failed.emit(f"{type(e).__name__}: {e}")
+
+
 class SettingsDialog(QDialog):
     def __init__(self, parent, adb_path: str, aapt2_path: str):
         super().__init__(parent)
@@ -117,11 +136,15 @@ class SettingsDialog(QDialog):
         w2 = QWidget(); w2.setLayout(aapt_row)
         form.addRow("aapt2 路径（可选）", w2)
 
-        note = QLabel("留空即自动探测 Android SDK。aapt2 只用于显示应用中文名，"
-                      "没有它全部功能照常工作。")
+        note = QLabel("留空即优先使用 exe 内置的 aapt2，其次自动探测 Android SDK。"
+                      "aapt2 只用于显示应用中文名，没有它其余功能照常工作。")
         note.setWordWrap(True)
         note.setProperty("hint", True)
         form.addRow("", note)
+
+        self.auto_label_box = QCheckBox("刷新应用后自动解析第三方应用名（按需拉取 APK）")
+        self.auto_label_box.setChecked(parent.setting_auto_label())
+        form.addRow("", self.auto_label_box)
 
         self.confirm_box = QCheckBox("危险操作（卸载 / 清数据 / 设备管理员）执行前二次确认")
         self.confirm_box.setChecked(parent.setting_confirm())
@@ -150,9 +173,10 @@ class SettingsDialog(QDialog):
         if path:
             edit.setText(path)
 
-    def values(self) -> tuple[str, str, bool, bool]:
+    def values(self) -> tuple[str, str, bool, bool, bool]:
         return (self.adb_edit.text().strip(), self.aapt_edit.text().strip(),
-                self.confirm_box.isChecked(), self.autoswitch_box.isChecked())
+                self.confirm_box.isChecked(), self.autoswitch_box.isChecked(),
+                self.auto_label_box.isChecked())
 
 
 class MainWindow(QMainWindow):
@@ -172,6 +196,8 @@ class MainWindow(QMainWindow):
         self.labels: LabelResolver | None = None
         self.apps: list[tuple[str, str, str, str]] = []  # pkg, label, kind, state
         self.workers: list[Worker] = []
+        self._label_stop = threading.Event()
+        self._label_worker: BatchWorker | None = None
 
         self._build_ui()
         # --gui-smoke：只构造窗口、不连设备、不弹免责声明，用于打包后的界面自检
@@ -195,6 +221,9 @@ class MainWindow(QMainWindow):
 
     def setting_aapt2_path(self) -> str:
         return self.settings.value("aapt2_path", "", str)
+
+    def setting_auto_label(self) -> bool:
+        return self.settings.value("auto_label", True, bool)
 
     # ------------------------------------------------------------- UI 构建
 
@@ -245,6 +274,9 @@ class MainWindow(QMainWindow):
         self.setStatusBar(self.status)
         self.status_label = QLabel("未连接设备")
         self.status.addWidget(self.status_label, 1)
+        self.aapt_label = QLabel("")
+        self.aapt_label.setProperty("hint", True)
+        self.status.addPermanentWidget(self.aapt_label)
         self.identity_label = QLabel("")
         self.status.addPermanentWidget(self.identity_label)
 
@@ -269,6 +301,12 @@ class MainWindow(QMainWindow):
         self.btn_wifi.setToolTip("输入 手机IP:端口，先用 USB 执行过一次 adb tcpip 5555")
         self.btn_wifi.clicked.connect(self._wifi_connect)
         h.addWidget(self.btn_wifi)
+
+        self.btn_reconnect = QPushButton("重连")
+        self.btn_reconnect.setToolTip("对 offline 设备执行 adb reconnect offline；"
+                                      "仍不恢复需重新插拔 USB 并在手机上允许 USB 调试")
+        self.btn_reconnect.clicked.connect(self._reconnect)
+        h.addWidget(self.btn_reconnect)
 
         self.root_box = QCheckBox("root 模式 (su -c)")
         self.root_box.setToolTip("设备已 root 时勾选；普通 adb shell 已是 uid=2000(shell)，通常不需要")
@@ -315,15 +353,19 @@ class MainWindow(QMainWindow):
         v.addWidget(self.app_count)
 
         brow = QHBoxLayout()
+        brow.setSpacing(6)
         self.btn_refresh_apps = QPushButton("刷新应用")
         self.btn_refresh_apps.setProperty("accent", True)
         self.btn_refresh_apps.clicked.connect(self.refresh_apps)
         brow.addWidget(self.btn_refresh_apps)
-        self.btn_resolve_label = QPushButton("解析当前应用名")
-        self.btn_resolve_label.setToolTip("用本机 aapt2 读取 APK 的 application-label")
+        self.btn_resolve_label = QPushButton("解析当前")
+        self.btn_resolve_label.setToolTip("重新解析选中应用的应用名；失败原因会写进日志")
         self.btn_resolve_label.clicked.connect(self._resolve_current_label)
         brow.addWidget(self.btn_resolve_label)
-        brow.addStretch(1)
+        self.btn_resolve_all = QPushButton("解析全部名称")
+        self.btn_resolve_all.setToolTip("后台批量解析所有应用名，再次点击可停止")
+        self.btn_resolve_all.clicked.connect(self._resolve_all_labels)
+        brow.addWidget(self.btn_resolve_all)
         v.addLayout(brow)
         return box
 
@@ -563,21 +605,27 @@ class MainWindow(QMainWindow):
         self.log(f"adb: {self.adb.path}")
         self.identity_label.setText(self.adb.version())
         self.labels = LabelResolver(self.adb, self.setting_aapt2_path() or None)
+        self.aapt_label.setText(self.labels.status)
+        self.log(f"应用名解析：{self.labels.status}"
+                 + ("" if self.labels.available else "（不影响授权、冻结等功能）"))
         self.refresh_devices()
 
     def _open_settings(self):
         dlg = SettingsDialog(self, self.setting_adb_path(), self.setting_aapt2_path())
         if not dlg.exec():
             return
-        adb_path, aapt2_path, confirm, autoswitch = dlg.values()
+        adb_path, aapt2_path, confirm, autoswitch, auto_label = dlg.values()
         self.settings.setValue("adb_path", adb_path)
         self.settings.setValue("aapt2_path", aapt2_path)
         self.settings.setValue("confirm_danger", confirm)
         self.settings.setValue("autoswitch", autoswitch)
+        self.settings.setValue("auto_label", auto_label)
         try:
             self.adb = Adb(path=adb_path or None)
             self.labels = LabelResolver(self.adb, aapt2_path or None)
+            self.aapt_label.setText(self.labels.status)
             self.log(f"adb 已切换：{self.adb.path}")
+            self.log(f"应用名解析：{self.labels.status}")
             self.identity_label.setText(self.adb.version())
             self.refresh_devices()
         except AdbError as e:
@@ -598,14 +646,16 @@ class MainWindow(QMainWindow):
         self.devices = devices
         self.device_combo.blockSignals(True)
         self.device_combo.clear()
-        usable = [d for d in devices if d.usable]
-        for d in usable:
-            self.device_combo.addItem(d.label(), d.serial)
-        if not usable:
-            self.device_combo.addItem("（没有已授权的设备）", "")
+        # offline / unauthorized 也要显示出来，否则用户根本不知道设备插上了但没授权
+        for d in devices:
+            tag = "" if d.usable else f"  [{d.state} · 不可用]"
+            self.device_combo.addItem(f"{d.label()}{tag}", d.serial if d.usable else "")
+        if not devices:
+            self.device_combo.addItem("（没有检测到设备）", "")
         self.device_combo.blockSignals(False)
         states = ", ".join(f"{d.serial}:{d.state}" for d in devices) or "无"
         self.log(f"设备枚举：{states}")
+        usable = [d for d in devices if d.usable]
         if usable:
             self.serial = usable[0].serial
             self.device_combo.setCurrentIndex(0)
@@ -613,8 +663,24 @@ class MainWindow(QMainWindow):
             self.refresh_apps()
         else:
             self.serial = ""
-            self.status_label.setText("未连接设备 —— 请插上 USB 并允许 USB 调试")
+            if devices:
+                bad = ", ".join(sorted({d.state for d in devices}))
+                self.status_label.setText(f"设备 {bad} —— 解锁手机、确认 USB 调试授权后点「重连」")
+                self.log(f"没有可用设备（{bad}）。offline 多为 USB 线/端口或 adb 服务异常；"
+                         "unauthorized 需在手机上点「允许 USB 调试」。")
+            else:
+                self.status_label.setText("未连接设备 —— 请插上 USB 并允许 USB 调试")
             self.identity_label.setText("")
+
+    def _reconnect(self):
+        if not self.adb:
+            return
+        self._async(
+            lambda: self.adb.raw(["reconnect", "offline"], timeout=20),
+            lambda r: (self.log(f"adb reconnect: {r.text().strip()[:120]}"),
+                       self.refresh_devices()),
+            busy="正在重连设备…",
+        )
 
     def _on_device_changed(self, index: int):
         if index < 0 or not self.device_combo.count():
@@ -665,6 +731,7 @@ class MainWindow(QMainWindow):
     def refresh_apps(self):
         if not self.adb or not self.serial:
             return
+        self._label_stop.set()  # 旧的批量解析不要往新列表里写
         serial = self.serial
         self._async(
             lambda: (core.package_inventory(self.adb, serial),
@@ -682,17 +749,22 @@ class MainWindow(QMainWindow):
         )
         installed = inv["installed"]
         apps: list[tuple[str, str, str, str]] = []
+        serial = self.serial
         for pkg in sorted(installed):
             kind = "系统" if pkg in system and pkg not in third else "第三方"
             state = "已冻结" if pkg in disabled else "正常"
-            # label 初始留空，只有用户主动解析过才填中文名，避免和包名列重复
-            apps.append((pkg, "", kind, state))
+            # 先填磁盘缓存里的名字，重启程序后不必重新 pull APK
+            label = self.labels.cached(serial, pkg) if self.labels else ""
+            apps.append((pkg, label, kind, state))
         for pkg in sorted(uninstalled):
             apps.append((pkg, "", "预装", "已卸载"))
         self.apps = apps
         self._fill_app_table()
+        named = sum(1 for _, l, _, _ in apps if l)
         self.log(f"应用列表：已安装 {len(installed)} / 冻结 {len(disabled)} / "
-                f"已卸载 {len(uninstalled)} / dangerous 权限 {len(dangerous)}")
+                f"已卸载 {len(uninstalled)} / dangerous 权限 {len(dangerous)}"
+                + (f" / 缓存恢复 {named} 个应用名" if named else ""))
+        self._maybe_auto_labels(inv, serial)
 
     def _fill_app_table(self, *_):
         keyword = self.search_edit.text().strip().lower()
@@ -723,8 +795,11 @@ class MainWindow(QMainWindow):
                     item.setForeground(QColor("#c5221f" if state == "已冻结" else "#b06000"))
                 self.app_table.setItem(i, j, item)
         self.app_table.blockSignals(False)
-        self.app_count.setText(f"显示 {len(rows)} / 共 {len(self.apps)} 个应用"
-                               "  ·  中文名可点「解析当前应用名」按需加载")
+        named = sum(1 for _, l, _, _ in self.apps if l)
+        hint = f"  ·  已解析名称 {named}/{len(self.apps)}"
+        if self.labels is not None and not self.labels.available:
+            hint += "  ·  aapt2 未就绪"
+        self.app_count.setText(f"显示 {len(rows)} / 共 {len(self.apps)} 个应用{hint}")
 
     def _current_pkg(self) -> str:
         row = self.app_table.currentRow()
@@ -749,13 +824,29 @@ class MainWindow(QMainWindow):
     def _load_target(self, pkg: str):
         if not self.adb or not self.serial:
             return
-        self._async(
-            lambda: core.describe(self.adb, self.serial, pkg),
-            lambda t: self._fill_target(t),
-            busy=f"正在读取 {pkg} 的清单…",
-        )
+        serial = self.serial
+        batching = bool(self._label_worker and self._label_worker.isRunning())
 
-    def _fill_target(self, t: core.Target):
+        def job():
+            t = core.describe(self.adb, serial, pkg)
+            # 选中系统应用时顺手补名字；批量任务在跑就交给它，避免并发 pull
+            if self.labels and not self._label_of(pkg) and not batching:
+                name, reason = self.labels.resolve_detail(serial, pkg)
+                return t, name, reason
+            return t, "", ""
+
+        self._async(job, self._fill_target, busy=f"正在读取 {pkg} 的清单…")
+
+    def _fill_target(self, data):
+        # 兼容 --gui-smoke --demo 直接传 core.Target
+        if isinstance(data, tuple):
+            t, name, reason = data
+        else:
+            t, name, reason = data, "", ""
+        if name:
+            self._apply_label(t.pkg, name)
+        elif reason and self.labels and self.labels.available:
+            self.log(f"应用名解析失败：{t.pkg} — {reason}")
         self.target = t
         self.perm_list.clear()
         suggested = core.suggested_permissions(t.perms, self.dangerous)
@@ -767,7 +858,9 @@ class MainWindow(QMainWindow):
         self.acc_edit.setText(", ".join(t.accessibility))
         self.nl_edit.setText(", ".join(t.listeners))
         self.admin_edit.setText(", ".join(t.admins))
-        self.grant_target.setText(f"{t.pkg}  ·  {len(t.perms)} 项权限 / "
+        head = f"{name}  ({t.pkg})" if name else (
+            f"{self._label_of(t.pkg)}  ({t.pkg})" if self._label_of(t.pkg) else t.pkg)
+        self.grant_target.setText(f"{head}  ·  {len(t.perms)} 项权限 / "
                                   f"{len(t.accessibility)} 无障碍 / "
                                   f"{len(t.listeners)} 通知 / {len(t.admins)} 管理员")
         self.log(f"清单：{t.pkg} 权限={len(t.perms)} acc={len(t.accessibility)} "
@@ -775,27 +868,134 @@ class MainWindow(QMainWindow):
 
     def _resolve_current_label(self):
         pkg = self._current_pkg()
-        if not pkg or not self.labels:
+        if not pkg:
+            QMessageBox.information(self, "未选择应用",
+                                    "请先在左侧列表点选一个应用，再解析名称。")
             return
-        if not self.labels.available:
-            QMessageBox.information(self, "未找到 aapt2",
-                                    "没有检测到 aapt2，应用名解析不可用。\n"
-                                    "功能不受影响，列表会显示包名。可在「设置」里手动指定 aapt2.exe。")
+        if not self.labels or not self.labels.available:
+            QMessageBox.information(
+                self, "应用名解析不可用",
+                "没有找到 aapt2，无法读取 APK 内的应用名。\n\n"
+                "· 确认 exe 完整（内置 aapt2.exe，不要只拷出一部分）\n"
+                "· 或到「设置」里手动指定 build-tools/aapt2.exe\n"
+                "· 也可设环境变量 AAPT2_PATH\n\n"
+                "缺少 aapt2 不影响授权、冻结、卸载等任何功能。")
             return
+        serial = self.serial
         self._async(
-            lambda: self.labels.resolve(self.serial, pkg),
-            lambda name: self._apply_label(pkg, name),
+            lambda: self.labels.resolve_detail(serial, pkg),
+            lambda tup: (self._apply_label(pkg, tup[0], tup[1]),
+                         self.labels.flush()),
             busy=f"正在解析 {pkg} 的应用名…",
         )
 
-    def _apply_label(self, pkg: str, name: str):
+    def _apply_label(self, pkg: str, name: str, reason: str = ""):
         if not name:
-            self.log(f"{pkg}: 未能解析应用名")
+            if reason:
+                self.log(f"应用名解析失败：{pkg} — {reason}")
             return
         self.apps = [(p, name if p == pkg else l, k, s) for p, l, k, s in self.apps]
         self._fill_app_table()
         self.grant_target.setText(f"{name}  ({pkg})")
         self.log(f"应用名：{pkg} → {name}")
+
+    # ------------------------------------------------------- 应用名批量解析
+
+    def _label_of(self, pkg: str) -> str:
+        return next((l for p, l, _, _ in self.apps if p == pkg), "")
+
+    def _maybe_auto_labels(self, inv: dict, serial: str):
+        """刷新列表后自动补齐第三方应用名；系统应用按需（选中时）解析。"""
+        if not self.setting_auto_label() or not self.labels or not serial:
+            return
+        if not self.labels.available:
+            self.log("跳过自动解析：aapt2 未就绪（内置副本缺失且本机无 SDK build-tools）")
+            return
+        targets = sorted(inv.get("third", set()) | inv.get("disabled", set()))
+        pending = [p for p in targets if not self.labels.cached(serial, p)]
+        if not pending:
+            return
+        self.log(f"后台自动解析第三方应用名：{len(pending)} 个（可在「设置」里关闭）")
+        self._start_label_batch(pending[:60], "自动解析")
+
+    def _resolve_all_labels(self):
+        if self._label_worker and self._label_worker.isRunning():
+            self._label_stop.set()
+            self.btn_resolve_all.setText("停止中…")
+            return
+        if not self.labels or not self.labels.available:
+            QMessageBox.information(
+                self, "应用名解析不可用",
+                "没有找到 aapt2，无法读取 APK 内的应用名。\n\n"
+                "请确认 exe 完整（内置 aapt2.exe），或到「设置」里手动指定路径。\n"
+                "缺少 aapt2 不影响其他功能。")
+            return
+        if not self.serial:
+            QMessageBox.information(self, "没有设备", "请先连接并授权一台 Android 设备。")
+            return
+        pending = [p for p, l, _, state in self.apps if not l and state != "已卸载"]
+        if not pending:
+            QMessageBox.information(self, "无需解析", "列表中的应用名都已解析完成。")
+            return
+        self._start_label_batch(pending, "批量解析")
+
+    def _start_label_batch(self, pkgs: list[str], tag: str):
+        if not self.labels or not self.serial:
+            return
+        if self._label_worker and self._label_worker.isRunning():
+            self._label_stop.set()
+            return
+        serial = self.serial
+        self._label_stop.clear()
+        worker = BatchWorker(
+            lambda emit: self.labels.resolve_many(serial, pkgs, emit, self._label_stop)
+        )
+        self._label_worker = worker
+        self.workers.append(worker)
+        worker.item.connect(self._on_label_item)
+        worker.finished_all.connect(self._on_label_done)
+        worker.failed.connect(self._on_label_failed)
+        self.btn_resolve_all.setText("停止解析")
+        self.log(f"{tag}：开始，共 {len(pkgs)} 个应用（逐个拉取 base.apk 读标签）")
+        worker.start()
+
+    def _on_label_item(self, payload):
+        pkg, name, reason, done, total = payload
+        if name:
+            self.apps = [(p, name if p == pkg else l, k, s)
+                         for p, l, k, s in self.apps]
+            self._update_label_cell(pkg, name)
+        self.status_label.setText(f"解析应用名 {done}/{total}  ·  {pkg}")
+        if reason and (done <= 2 or done % 10 == 0):
+            self.log(f"应用名失败 {pkg}: {reason}")
+
+    def _update_label_cell(self, pkg: str, name: str):
+        self.app_table.blockSignals(True)
+        for row in range(self.app_table.rowCount()):
+            item = self.app_table.item(row, 1)
+            if item and item.text() == pkg:
+                self.app_table.setItem(row, 0, QTableWidgetItem(name))
+                break
+        self.app_table.blockSignals(False)
+
+    def _on_label_done(self, count: int):
+        if self._label_worker in self.workers:
+            self.workers.remove(self._label_worker)
+        self.btn_resolve_all.setText("解析全部名称")
+        self._fill_app_table()
+        self.status_label.setText(f"应用名解析完成 · 本次成功 {count} 个")
+        self.log(f"应用名解析结束：成功 {count} 个，结果已写入缓存")
+        if self._label_worker:
+            self._label_worker.deleteLater()
+            self._label_worker = None
+
+    def _on_label_failed(self, msg: str):
+        self.btn_resolve_all.setText("解析全部名称")
+        self.log(f"[错误] 应用名批量解析异常：{msg}")
+        self.status_label.setText("应用名解析异常，详见日志")
+        if self._label_worker:
+            self._label_worker.deleteLater()
+            self._label_worker = None
 
     def _check_all(self, checked: bool):
         for i in range(self.perm_list.count()):
