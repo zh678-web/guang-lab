@@ -1,0 +1,5 @@
+# 运行依赖（Python 3.11+ / Windows）
+PySide6-Essentials>=6.8
+
+# 构建依赖：仅 build.py 打包时需要
+pyinstaller>=6.10

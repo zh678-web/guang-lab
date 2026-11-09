@@ -1,0 +1,2 @@
+# Android 端 sh 不认 CRLF，脚本必须始终以 LF 入库 / 检出
+guanglab/scripts/*.sh text eol=lf
