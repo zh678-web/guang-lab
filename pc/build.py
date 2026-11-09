@@ -98,6 +98,39 @@ def adb_files() -> list[Path]:
     return []
 
 
+def aapt2_files() -> tuple[Path | None, Path | None]:
+    """找出可随包附带的 aapt2.exe 与其 NOTICE（AOSP / Apache-2.0）。
+
+    优先本机 Android SDK，其次 pc/assets/build-tools（便于在无 SDK 的机器上构建）。
+    随包附带后，单文件 exe 不需要目标机器安装 Android SDK 也能解析应用名。
+    """
+    roots: list[Path] = []
+    for key in ("ANDROID_HOME", "ANDROID_SDK_ROOT"):
+        v = os.environ.get(key)
+        if v:
+            roots.append(Path(v) / "build-tools")
+    local = os.environ.get("LOCALAPPDATA")
+    if local:
+        roots.append(Path(local) / "Android" / "Sdk" / "build-tools")
+    roots.append(ASSETS / "build-tools")
+
+    exe_name = "aapt2.exe" if os.name == "nt" else "aapt2"
+    for root in roots:
+        if not root.is_dir():
+            continue
+        for d in sorted((x for x in root.iterdir() if x.is_dir()),
+                        key=lambda p: p.name, reverse=True):
+            exe = d / exe_name
+            if exe.is_file():
+                notice = d / "NOTICE.txt"
+                return exe, (notice if notice.is_file() else None)
+        exe = root / exe_name
+        if exe.is_file():
+            notice = root / "NOTICE.txt"
+            return exe, (notice if notice.is_file() else None)
+    return None, None
+
+
 def build() -> Path:
     if not PY.is_file() or not SP.is_dir():
         raise SystemExit(f"找不到打包 venv：{VENV}\n"
@@ -118,6 +151,13 @@ def build() -> Path:
         cmd += ["--icon", str(icon)]
     for f in adb_files():
         cmd += ["--add-binary", f"{f};platform-tools"]
+    aapt2, notice = aapt2_files()
+    if aapt2:
+        cmd += ["--add-binary", f"{aapt2};build-tools"]
+        if notice:
+            cmd += ["--add-data", f"{notice};build-tools"]
+    else:
+        print("[build] 警告：未找到 aapt2.exe，exe 将依赖目标机器上的 Android SDK")
     cmd += [
         "--exclude-module", "tkinter",
         "--exclude-module", "matplotlib",
@@ -131,6 +171,7 @@ def build() -> Path:
 
     print("[build] venv   :", VENV)
     print("[build] adb    :", ", ".join(f.name for f in adb_files()) or "未附带（运行时自动探测）")
+    print("[build] aapt2  :", aapt2 or "未附带（运行时探测本机 SDK）")
     print("[build] icon   :", icon if has_icon else "生成失败，跳过")
     print("[build] cmd    :", " ".join(cmd[:8]), "...\n")
     r = subprocess.run(cmd, cwd=str(PC), env=env)

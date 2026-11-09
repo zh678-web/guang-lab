@@ -50,6 +50,20 @@ def selftest() -> int:
 
     adb = find_adb()
     print(f"adb      : {adb or 'NOT FOUND (can be set in Settings)'}")
+
+    from guanglab.labels import aapt2_status, find_aapt2
+    a2 = find_aapt2()
+    print(f"aapt2    : {aapt2_status(a2)}  ({a2 or 'NOT FOUND'})")
+    if a2:
+        try:
+            import subprocess
+            p = subprocess.run([a2, "version"], capture_output=True, timeout=20)
+            runnable = p.returncode == 0
+            print(f"  [{'OK' if runnable else 'FAIL'}] aapt2 version")
+            ok = ok and runnable
+        except Exception as e:
+            print(f"  [FAIL] aapt2 无法运行: {e}")
+            ok = False
     print("SELFTEST " + ("PASS" if ok else "FAIL"))
     try:
         sys.stdout.flush()
